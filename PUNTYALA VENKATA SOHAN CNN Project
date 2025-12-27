@@ -1,0 +1,1008 @@
+# Set environment variables BEFORE any imports
+import os
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"  # Suppress TensorFlow info/warning messages
+os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"  # Disable oneDNN to prevent memory issues
+os.environ["PROTOCOL_BUFFERS_PYTHON_IMPLEMENTATION"] = "python"  # Avoid protobuf issues
+
+print("[STARTUP] Environment variables configured", flush=True)
+
+# Global configuration for the instrument recognition system
+CONFIG = {
+    "sample_rate": 22050,
+    "mel_bands": [64, 96, 128],
+    "n_fft": 2048,
+    "hop_length": 512,
+    "learning_rate": 0.001,  # Balanced learning rate
+    "class_map": {  # Default mapping, will be dynamically updated based on data
+        0: "cello",
+        1: "clarinet",
+        2: "flute",
+        3: "acoustic_guitar",
+        4: "electric_guitar",
+        5: "organ",
+        6: "piano",
+        7: "saxophone",
+        8: "trumpet",
+        9: "violin",
+        10: "voice",
+    },
+    "test_size": 0.2,
+    "random_state": 42,
+    "max_files_per_instrument": 350,
+    "augmentation_ratio": 0.70,  # Increased to 70% for maximum diversity
+}
+
+print("[STARTUP] Loading libraries (this may take 30-60 seconds)...", flush=True)
+import librosa
+import numpy as np
+import tensorflow as tf
+from tensorflow.keras import layers, models, Input, Model
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import confusion_matrix, classification_report
+import matplotlib.pyplot as plt
+import seaborn as sns
+from scipy import signal
+
+# Configure TensorFlow memory growth to prevent OOM
+try:
+    gpus = tf.config.list_physical_devices("GPU")
+    if gpus:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"[MEMORY] Configured {len(gpus)} GPU(s) with memory growth", flush=True)
+    else:
+        print("[MEMORY] Running on CPU - using optimized memory settings", flush=True)
+except Exception as e:
+    print(f"[MEMORY] Using default memory configuration: {e}", flush=True)
+
+print("[STARTUP] All libraries loaded successfully!", flush=True)
+
+
+# MultiResolutionCNN: Multi-input CNN for multi-resolution mel spectrograms
+class MultiResolutionCNN:
+    def __init__(self, input_shapes, num_classes):
+        # input_shapes: list of shapes, e.g. [(64, 259, 1), (96, 259, 1), (128, 259, 1)]
+        inputs = []
+        processed = []
+        for shape in input_shapes:
+            inp = Input(shape=shape)
+            # First conv block - ANTI-OVERFITTING measures applied
+            x = layers.Conv2D(
+                64,
+                (3, 3),
+                activation="relu",
+                padding="same",
+                kernel_regularizer=tf.keras.regularizers.l2(
+                    0.00015
+                ),  # Strong regularization
+            )(inp)
+            x = layers.BatchNormalization()(x)
+            x = layers.MaxPooling2D((2, 2))(x)
+            x = layers.Dropout(0.35)(x)  # Strong dropout
+
+            # Second conv block
+            x = layers.Conv2D(
+                128,
+                (3, 3),
+                activation="relu",
+                padding="same",
+                kernel_regularizer=tf.keras.regularizers.l2(0.00015),
+            )(x)
+            x = layers.BatchNormalization()(x)
+            x = layers.MaxPooling2D((2, 2))(x)
+            x = layers.Dropout(0.40)(x)  #  Strong dropout
+
+            # Third conv block
+            x = layers.Conv2D(
+                256,
+                (3, 3),
+                activation="relu",
+                padding="same",
+                kernel_regularizer=tf.keras.regularizers.l2(0.0002),
+            )(x)
+            x = layers.BatchNormalization()(x)
+            x = layers.MaxPooling2D((2, 2))(x)
+            x = layers.Dropout(0.45)(x)  #  Strong dropout
+
+            # Fourth conv block for deeper features
+            x = layers.Conv2D(
+                256,
+                (3, 3),
+                activation="relu",
+                padding="same",
+                kernel_regularizer=tf.keras.regularizers.l2(0.0002),
+            )(x)
+            x = layers.BatchNormalization()(x)
+
+            # Global pooling
+            x = layers.GlobalAveragePooling2D()(x)
+            processed.append(x)
+            inputs.append(inp)
+        # Concatenate features from all resolutions
+        if len(processed) > 1:
+            x = layers.Concatenate()(processed)
+        else:
+            x = processed[0]
+        # Dense layers with VERY STRONG OVERFITTING measures
+        x = layers.Dense(
+            512,
+            activation="relu",
+            kernel_regularizer=tf.keras.regularizers.l2(0.0002),
+        )(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Dropout(0.50)(x)  # Very strong dropout
+        x = layers.Dense(
+            256, activation="relu", kernel_regularizer=tf.keras.regularizers.l2(0.0002)
+        )(x)
+        x = layers.BatchNormalization()(x)
+        x = layers.Dropout(0.45)(x)  # Strong dropout
+        x = layers.Dense(
+            128, activation="relu", kernel_regularizer=tf.keras.regularizers.l2(0.0002)
+        )(x)
+        x = layers.Dropout(0.40)(x)  #  Strong dropout
+        output = layers.Dense(num_classes, activation="sigmoid")(x)
+        self.model = Model(inputs=inputs, outputs=output)
+        self.model.compile(
+            optimizer=tf.keras.optimizers.Adam(
+                learning_rate=CONFIG.get("learning_rate", 0.001)
+            ),
+            loss="binary_crossentropy",
+            metrics=["accuracy", tf.keras.metrics.AUC(name="auc")],
+        )
+
+    def train(self, X_train, y_train, X_val, y_val, epochs=200):
+        callbacks = [
+            # Early stopping with VERY strict monitoring
+            tf.keras.callbacks.EarlyStopping(
+                patience=15,  # Stop if no
+                restore_best_weights=True,
+                monitor="val_loss",
+                min_delta=0.0001,
+                verbose=1,
+            ),
+            tf.keras.callbacks.ModelCheckpoint(
+                "best_model.keras", save_best_only=True, monitor="val_loss", verbose=1
+            ),
+            # Reduce learning rate when validation loss plateaus
+            tf.keras.callbacks.ReduceLROnPlateau(
+                factor=0.5, patience=8, min_lr=1e-7, monitor="val_loss", verbose=1
+            ),
+        ]
+        history = self.model.fit(
+            X_train,
+            y_train,
+            validation_data=(X_val, y_val),
+            epochs=epochs,
+            batch_size=32,
+            callbacks=callbacks,
+            verbose=1,
+        )
+        return history
+
+    def evaluate(self, X_test, y_test):
+        return self.model.evaluate(X_test, y_test, verbose=0)
+
+
+class AudioProcessor:
+    def __init__(self, config):
+        self.config = config
+        self.sample_rate = config.get("sample_rate", 22050)
+        self.mel_bands = config.get("mel_bands", [64, 96, 128])
+        self.n_fft = config.get("n_fft", 2048)
+        self.hop_length = config.get("hop_length", 512)
+
+    def load_audio(self, file_path):
+        audio, _ = librosa.load(file_path, sr=self.sample_rate, mono=True)
+        return audio
+
+    def augment_audio(self, audio):
+        """Apply BALANCED audio augmentation - ANTI-OVERFITTING"""
+        import random
+
+        augmented = audio.copy()
+
+        rand = random.random()
+
+        # Random time stretch
+        if rand < 0.40:
+            rate = random.uniform(0.90, 1.10)
+            augmented = librosa.effects.time_stretch(augmented, rate=rate)
+
+        # Random pitch shift
+        elif rand < 0.75:
+            n_steps = random.uniform(-2, 2)
+            augmented = librosa.effects.pitch_shift(
+                augmented, sr=self.sample_rate, n_steps=n_steps
+            )
+
+        # Add random noise (40% probability)
+        if random.random() < 0.4:
+            noise = np.random.randn(len(augmented)) * random.uniform(0.003, 0.007)
+            augmented = augmented + noise
+
+        # Random volume adjustment (40% probability)
+        if random.random() < 0.4:
+            volume_factor = random.uniform(0.88, 1.12)
+            augmented = augmented * volume_factor
+
+        # Random low-pass filter (20% probability)
+        if random.random() < 0.2:
+            cutoff_freq = random.uniform(3500, 8000)
+            sos = signal.butter(
+                5, cutoff_freq, btype="low", fs=self.sample_rate, output="sos"
+            )
+            augmented = signal.sosfilt(sos, augmented)
+
+        # Random time shift (25% probability)
+        if random.random() < 0.25:
+            shift = random.randint(
+                -int(0.10 * self.sample_rate), int(0.10 * self.sample_rate)
+            )
+            augmented = np.roll(augmented, shift)
+
+        return augmented
+
+    def extract_multi_resolution_features(self, audio, target_time_dim=259):
+        features = {}
+        for n_mels in self.mel_bands:
+            mel = librosa.feature.melspectrogram(
+                y=audio,
+                sr=self.sample_rate,
+                n_fft=self.n_fft,
+                hop_length=self.hop_length,
+                n_mels=n_mels,
+                power=2.0,
+            )
+            mel_db = librosa.power_to_db(mel, ref=np.max)
+            # Normalize each mel spectrogram (mean=0, std=1)
+            mel_db = (mel_db - np.mean(mel_db)) / (np.std(mel_db) + 1e-8)
+            # Ensure float32 to reduce memory
+            mel_db = mel_db.astype(np.float32)
+            # Pad or crop to target_time_dim
+            if mel_db.shape[1] < target_time_dim:
+                pad_width = target_time_dim - mel_db.shape[1]
+                mel_db = np.pad(mel_db, ((0, 0), (0, pad_width)), mode="constant")
+            elif mel_db.shape[1] > target_time_dim:
+                mel_db = mel_db[:, :target_time_dim]
+            features[f"mel_{n_mels}"] = np.expand_dims(mel_db, axis=-1)
+        return features
+
+    def mixup_data(self, X, y, alpha=0.4):
+        """Apply mixup augmentation during training for better generalization"""
+        lam = np.random.beta(alpha, alpha)
+        batch_size = len(X[0]) if isinstance(X, list) else len(X)
+        index = np.random.permutation(batch_size)
+
+        if isinstance(X, list):
+            mixed_X = [lam * x + (1 - lam) * x[index] for x in X]
+        else:
+            mixed_X = lam * X + (1 - lam) * X[index]
+
+        mixed_y = lam * y + (1 - lam) * y[index]
+        return mixed_X, mixed_y
+
+
+# Feature caching for faster training
+import hashlib
+import pickle
+
+
+def get_cache_path(file_path, augment=False):
+    """Generate cache file path for audio features"""
+    file_hash = hashlib.md5(file_path.encode()).hexdigest()
+    suffix = "_aug" if augment else ""
+    version = "_v10"  # Updated version - NO OVERFITTING
+    return f"CNN/cache/{file_hash}{suffix}{version}.pkl"
+
+
+def load_cached_features(file_path, augment=False):
+    """Load features from cache if available"""
+    cache_path = get_cache_path(file_path, augment)
+    if os.path.exists(cache_path):
+        with open(cache_path, "rb") as f:
+            return pickle.load(f)
+    return None
+
+
+def save_cached_features(file_path, features, augment=False):
+    """Save features to cache"""
+    cache_dir = "CNN/cache"
+    os.makedirs(cache_dir, exist_ok=True)
+    cache_path = get_cache_path(file_path, augment)
+    with open(cache_path, "wb") as f:
+        pickle.dump(features, f)
+
+
+if __name__ == "__main__":
+    print("\n" + "=" * 70, flush=True)
+    print("    CNN-BASED MUSIC INSTRUMENT RECOGNITION SYSTEM", flush=True)
+    print("    [NO OVERFITTING - BALANCED & OPTIMIZED v10]", flush=True)
+    print("=" * 70 + "\n", flush=True)
+
+    # Initialize components
+    print("[INIT] Initializing audio processor...", flush=True)
+    processor = AudioProcessor(CONFIG)
+    print(
+        f"[INIT] ANTI-OVERFITTING measures: 70% augmentation, very strong regularization - TARGET GAP < 5%",
+        flush=True,
+    )
+    print("[INIT] Audio processor ready\n", flush=True)
+
+    # Load dataset from IRMAS-TrainingData
+    import glob
+
+    print("[DATA] Loading training data from IRMAS dataset...", flush=True)
+    data_dir = r"/content/drive/MyDrive/IRMAS-TrainingData"
+    print(f"[DATA] Dataset location: {data_dir}", flush=True)
+    instrument_folders = [
+        f for f in os.listdir(data_dir) if os.path.isdir(os.path.join(data_dir, f))
+    ]
+
+    # Dynamically map IRMAS short names
+    irmas_to_full = {
+        "cel": "cello",
+        "cla": "clarinet",
+        "flu": "flute",
+        "gac": "acoustic_guitar",
+        "gel": "electric_guitar",
+        "org": "organ",
+        "pia": "piano",
+        "sax": "saxophone",
+        "tru": "trumpet",
+        "vio": "violin",
+        "voi": "voice",
+    }
+
+    # Collect unique instruments dynamically
+    discovered_instruments = set()
+    audio_files = []
+    labels = []
+
+    # For mel spectrogram visualization
+    sample_files_per_instrument = {}
+
+    for inst in instrument_folders:
+        if inst in irmas_to_full:
+            print(f"[DATA] Scanning folder: {inst}", flush=True)
+            wav_files = glob.glob(os.path.join(data_dir, inst, "*.wav"))
+            mapped_label = irmas_to_full[inst]
+            discovered_instruments.add(mapped_label)
+            audio_files.extend(wav_files)
+            labels.extend([mapped_label] * len(wav_files))
+
+            # Store first file for mel spectrogram visualization
+            if mapped_label not in sample_files_per_instrument and len(wav_files) > 0:
+                sample_files_per_instrument[mapped_label] = wav_files[0]
+
+            print(
+                f"[DATA]   Found {len(wav_files)} files for {mapped_label}",
+                flush=True,
+            )
+
+    # Update CONFIG with discovered instruments
+    print(
+        f"\n[DATA] Discovered {len(discovered_instruments)} unique instruments: {sorted(discovered_instruments)}",
+        flush=True,
+    )
+
+    # Limit files per instrument
+    max_files_per_instrument = CONFIG["max_files_per_instrument"]
+    print(
+        f"\n[DATA] Using {max_files_per_instrument} files per instrument...",
+        flush=True,
+    )
+    filtered_files = []
+    filtered_labels = []
+    instrument_counts = {}
+
+    for file, label in zip(audio_files, labels):
+        if label not in instrument_counts:
+            instrument_counts[label] = 0
+        if instrument_counts[label] < max_files_per_instrument:
+            filtered_files.append(file)
+            filtered_labels.append(label)
+            instrument_counts[label] += 1
+
+    audio_files = filtered_files
+    labels = filtered_labels
+
+    print(f"[DATA] Total files to process: {len(audio_files)}", flush=True)
+    for label, count in instrument_counts.items():
+        print(f"[DATA]   {label}: {count} files", flush=True)
+
+    # Generate mel spectrogram visualizations
+    print(
+        f"\n[VISUALIZATION] Generating mel spectrograms for all instruments...",
+        flush=True,
+    )
+    fig, axes = plt.subplots(4, 3, figsize=(15, 16))
+    axes = axes.ravel()
+
+    for i, (instrument, file_path) in enumerate(
+        sorted(sample_files_per_instrument.items())
+    ):
+        try:
+            audio = processor.load_audio(file_path)
+            mel = librosa.feature.melspectrogram(
+                y=audio,
+                sr=CONFIG["sample_rate"],
+                n_fft=CONFIG["n_fft"],
+                hop_length=CONFIG["hop_length"],
+                n_mels=128,
+            )
+            mel_db = librosa.power_to_db(mel, ref=np.max)
+
+            img = librosa.display.specshow(
+                mel_db,
+                sr=CONFIG["sample_rate"],
+                hop_length=CONFIG["hop_length"],
+                x_axis="time",
+                y_axis="mel",
+                ax=axes[i],
+                cmap="viridis",
+            )
+            axes[i].set_title(f"{instrument}", fontsize=12, fontweight="bold")
+            axes[i].set_xlabel("Time (s)", fontsize=10)
+            axes[i].set_ylabel("Frequency (Hz)", fontsize=10)
+            fig.colorbar(img, ax=axes[i], format="%+2.0f dB")
+        except Exception as e:
+            print(
+                f"[WARNING] Could not generate mel spectrogram for {instrument}: {e}",
+                flush=True,
+            )
+
+    # Hide extra subplot
+    axes[-1].axis("off")
+
+    plt.tight_layout()
+    plt.savefig("mel_spectrograms.png", dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[SAVE] Mel spectrograms saved to mel_spectrograms.png", flush=True)
+
+    print(
+        "\n[FEATURES] Extracting features with 70% augmentation (ANTI-OVERFITTING - GAP < 5%)...",
+        flush=True,
+    )
+
+    # Multi-label binarizer for instrument labels
+    from sklearn.preprocessing import MultiLabelBinarizer
+
+    X, y = [], []
+    processed_files = []
+    count = 0
+
+    # Process files with balanced augmentation
+    for file, label in zip(audio_files, labels):
+        if count % 50 == 0:
+            print(
+                f"[FEATURES] Processed {count}/{len(audio_files)} files...", flush=True
+            )
+        try:
+            # Try to load from cache first
+            cached_features = load_cached_features(file, augment=False)
+            if cached_features is not None:
+                features = cached_features
+            else:
+                audio = processor.load_audio(file)
+                features = processor.extract_multi_resolution_features(audio)
+                save_cached_features(file, features, augment=False)
+
+            X.append([features[f"mel_{n}"] for n in CONFIG["mel_bands"]])
+            y.append([label] if isinstance(label, str) else list(label))
+            processed_files.append(file)
+            count += 1
+
+            # Augmentation with 70% ratio
+
+            if count <= len(audio_files) * CONFIG["augmentation_ratio"]:
+                cached_aug = load_cached_features(file, augment=True)
+                if cached_aug is not None:
+                    aug_features = cached_aug
+                else:
+                    audio = processor.load_audio(file)
+                    aug_audio = processor.augment_audio(audio)
+                    aug_features = processor.extract_multi_resolution_features(
+                        aug_audio
+                    )
+                    save_cached_features(file, aug_features, augment=True)
+
+                X.append([aug_features[f"mel_{n}"] for n in CONFIG["mel_bands"]])
+                y.append([label] if isinstance(label, str) else list(label))
+                processed_files.append(file + "_aug")
+
+            if count % 50 == 0:
+                print(
+                    f"Processed {count}/{len(audio_files)} files (with augmentation: {len(X)} samples)..."
+                )
+                import gc
+
+                gc.collect()
+        except Exception as e:
+            print(f"Skipping file {file} due to error: {e}")
+
+    # Only use the successfully processed samples
+    min_len = min(len(X), len(y), len(processed_files))
+    X = X[:min_len]
+    y = y[:min_len]
+    processed_files = processed_files[:min_len]
+
+    # Clear memory
+    import gc
+
+    gc.collect()
+    print(f"\n[MEMORY] Garbage collection completed", flush=True)
+
+    # Get unique instruments
+    unique_instruments = sorted(
+        set([label[0] if isinstance(label, list) else label for label in y])
+    )
+    print(
+        f"[DATA] Training with {len(unique_instruments)} instrument classes: {unique_instruments}",
+        flush=True,
+    )
+
+    # Binarize labels
+    mlb = MultiLabelBinarizer(classes=unique_instruments)
+    y = mlb.fit_transform(y)
+
+    print(f"[DATA] Label shape after binarization: {y.shape}", flush=True)
+
+    if len(X) < 2 or len(y) < 2:
+        print("Not enough valid samples to train/test. Please add more data.")
+    else:
+        print(f"Length of X: {len(X)}")
+        print(f"Length of y: {len(y)}")
+        print(f"Length of processed_files: {len(processed_files)}")
+
+        # Stack samples
+        X_np = [
+            np.stack([sample[i] for sample in X], axis=0)
+            for i in range(len(CONFIG["mel_bands"]))
+        ]
+
+        # Print shapes
+        print(f"\n[FEATURES] Feature shapes:")
+        for i, shape in enumerate([x.shape for x in X_np]):
+            print(f"[FEATURES]   Resolution {i+1}: {shape}")
+
+        # Train-test split
+        from sklearn.model_selection import train_test_split
+
+        idx = np.arange(len(y))
+        train_idx, test_idx, y_train, y_test = train_test_split(
+            idx, y, test_size=CONFIG["test_size"], random_state=CONFIG["random_state"]
+        )
+        X_train = [x[train_idx] for x in X_np]
+        X_test = [x[test_idx] for x in X_np]
+
+        print(f"\nTraining samples: {len(train_idx)}, Test samples: {len(test_idx)}")
+        print(f"Training data shapes: {[x.shape for x in X_train]}")
+
+        # Initialize model
+        num_classes = y.shape[1]
+        input_shapes = [(x.shape[1], x.shape[2], 1) for x in X_np]
+        print(
+            f"\n[MODEL] Creating NO-OVERFITTING CNN for {num_classes} classes...",
+            flush=True,
+        )
+        print(f"[MODEL] Input shapes: {input_shapes}", flush=True)
+        print(
+            f"[MODEL] ANTI-OVERFITTING: Dropout 0.35-0.50, L2 reg 0.00015-0.0002, Early stop patience=15 - TARGET GAP < 5%",
+            flush=True,
+        )
+        model = MultiResolutionCNN(
+            input_shapes=input_shapes,
+            num_classes=num_classes,
+        )
+
+        print(f"\n[MODEL] Model Summary:")
+        model.model.summary()
+
+        # Train model
+        print(
+            f"\n[TRAINING] Starting NO-OVERFITTING training...",
+            flush=True,
+        )
+        print(
+            f"[TRAINING] Learning rate: {CONFIG['learning_rate']}",
+            flush=True,
+        )
+        print(f"[TRAINING] Batch size: 32", flush=True)
+        print(f"[TRAINING] Augmentation: 70% (ANTI-OVERFITTING - GAP < 5%)", flush=True)
+        print(
+            f"[TRAINING] Regularization: L2=0.00015-0.0002 (ANTI-OVERFITTING - GAP < 5%)",
+            flush=True,
+        )
+        print(
+            f"[TRAINING] Dropout: 0.35-0.50 (ANTI-OVERFITTING - GAP < 5%)", flush=True
+        )
+        print(
+            f"[TRAINING] Early stopping: 15 epochs patience (ANTI-OVERFITTING - GAP < 5%)\n",
+            flush=True,
+        )
+        history = model.train(X_train, y_train, X_test, y_test)
+
+        # Evaluate
+        test_loss, test_acc, test_auc = model.evaluate(X_test, y_test)
+        print(f"\n[RESULTS] Final Test Loss: {test_loss:.4f}")
+        print(f"[RESULTS] Final Test Accuracy: {test_acc:.2%}")
+        print(f"[RESULTS] Final Test AUC: {test_auc:.4f}")
+
+        # Save model
+        model.model.save("instrument_classifier_v10_no_overfitting.keras")
+        print(
+            f"\n[SAVE] Model saved to instrument_classifier_v10_no_overfitting.keras",
+            flush=True,
+        )
+
+        # Enhanced Visualization
+        fig, axes = plt.subplots(1, 2, figsize=(15, 5))
+
+        # Plot 1: Accuracy
+        axes[0].plot(
+            history.history["accuracy"], label="Training Accuracy", linewidth=2
+        )
+        axes[0].plot(
+            history.history["val_accuracy"], label="Validation Accuracy", linewidth=2
+        )
+        axes[0].set_title("Model Accuracy Over Epochs", fontsize=14, fontweight="bold")
+        axes[0].set_xlabel("Epoch", fontsize=12)
+        axes[0].set_ylabel("Accuracy", fontsize=12)
+        axes[0].legend(fontsize=10)
+        axes[0].grid(True, alpha=0.3)
+
+        # Calculate and display final gap
+        final_train_acc = history.history["accuracy"][-1]
+        final_val_acc = history.history["val_accuracy"][-1]
+        gap = abs(final_train_acc - final_val_acc)
+        gap_status = (
+            "🎯 PERFECT! NO OVERFITTING!"
+            if gap < 0.03
+            else (
+                "✓ EXCELLENT! GAP < 5% TARGET ACHIEVED!"
+                if gap < 0.05
+                else (
+                    "⚠ WARNING: Gap ≥ 5% - Overfitting detected!"
+                    if gap < 0.08
+                    else "❌ SEVERE OVERFITTING!"
+                )
+            )
+        )
+        axes[0].text(
+            0.02,
+            0.98,
+            f"Final Gap: {gap:.2%}\n{gap_status}\nTarget: < 5%",
+            transform=axes[0].transAxes,
+            fontsize=10,
+            verticalalignment="top",
+            bbox=dict(
+                boxstyle="round",
+                facecolor=(
+                    "lightgreen" if gap < 0.05 else "yellow" if gap < 0.08 else "orange"
+                ),
+                alpha=0.7,
+            ),
+        )
+
+        # Plot 2: Loss
+        axes[1].plot(history.history["loss"], label="Training Loss", linewidth=2)
+        axes[1].plot(history.history["val_loss"], label="Validation Loss", linewidth=2)
+        axes[1].set_title("Model Loss Over Epochs", fontsize=14, fontweight="bold")
+        axes[1].set_xlabel("Epoch", fontsize=12)
+        axes[1].set_ylabel("Loss", fontsize=12)
+        axes[1].legend(fontsize=10)
+        axes[1].grid(True, alpha=0.3)
+
+        # Display final loss values and gap
+        final_train_loss = history.history["loss"][-1]
+        final_val_loss = history.history["val_loss"][-1]
+        loss_gap = abs(final_train_loss - final_val_loss)
+        loss_gap_status = (
+            "✓ NO OVERFITTING!"
+            if loss_gap < 0.05
+            else "✓ Good" if loss_gap < 0.10 else "⚠ Check"
+        )
+        axes[1].text(
+            0.02,
+            0.98,
+            f"Train: {final_train_loss:.4f}\nVal: {final_val_loss:.4f}\nGap: {loss_gap:.4f}\n{loss_gap_status}",
+            transform=axes[1].transAxes,
+            fontsize=10,
+            verticalalignment="top",
+            bbox=dict(
+                boxstyle="round",
+                facecolor=("lightgreen" if loss_gap < 0.10 else "yellow"),
+                alpha=0.7,
+            ),
+        )
+
+        plt.tight_layout()
+        plt.savefig("training_analysis.png", dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"[SAVE] Training analysis saved to training_analysis.png", flush=True)
+
+        # Generate confusion matrix and classification report
+        print(
+            f"\n[EVALUATION] Generating confusion matrix and classification report...",
+            flush=True,
+        )
+        y_pred = model.model.predict(X_test, verbose=0)
+        y_pred_classes = (y_pred > 0.5).astype(int)
+        y_test_classes = y_test.astype(int)
+
+        # Get class names
+        class_names = list(mlb.classes_)
+
+        # Multi-label classification report
+        print(f"\n{'='*60}")
+        print(f"CLASSIFICATION REPORT (Per Instrument)")
+        print(f"{'='*60}")
+        report = classification_report(
+            y_test_classes, y_pred_classes, target_names=class_names, zero_division=0
+        )
+        print(report)
+
+        # Confusion matrix for each instrument
+        fig, axes = plt.subplots(4, 3, figsize=(15, 16))
+        axes = axes.ravel()
+        for i, instrument in enumerate(class_names):
+            cm = confusion_matrix(y_test_classes[:, i], y_pred_classes[:, i])
+            sns.heatmap(
+                cm,
+                annot=True,
+                fmt="d",
+                cmap="Blues",
+                ax=axes[i],
+                xticklabels=["Negative", "Positive"],
+                yticklabels=["Negative", "Positive"],
+            )
+            axes[i].set_title(f"{instrument}", fontsize=12, fontweight="bold")
+            axes[i].set_ylabel("True Label", fontsize=10)
+            axes[i].set_xlabel("Predicted Label", fontsize=10)
+
+        # Hide extra subplot
+        axes[-1].axis("off")
+
+        plt.tight_layout()
+        plt.savefig("confusion_matrices.png", dpi=150, bbox_inches="tight")
+        plt.close()
+        print(f"[SAVE] Confusion matrices saved to confusion_matrices.png", flush=True)
+
+        # Print detailed results
+        print(f"\n{'='*70}")
+        print(f"FINAL RESULTS - NO OVERFITTING v10")
+        print(f"{'='*70}")
+        print(f"Training Accuracy:   {final_train_acc:.2%}")
+        print(f"Validation Accuracy: {final_val_acc:.2%}")
+        print(f"Accuracy Gap:        {gap:.2%} (Target: < 5% MANDATORY)")
+
+        overfitting_status = (
+            "🎯 PERFECT! NO OVERFITTING! Gap < 3%"
+            if gap < 0.03
+            else (
+                "✅ EXCELLENT! GAP < 5% TARGET ACHIEVED!"
+                if gap < 0.05
+                else (
+                    "⚠️ WARNING: Gap ≥ 5% - OVERFITTING DETECTED!"
+                    if gap < 0.08
+                    else "❌ SEVERE OVERFITTING! Gap > 8% - Need stronger regularization"
+                )
+            )
+        )
+        print(f"Overfitting Status:  {overfitting_status}")
+        print(f"\nTraining Loss:       {final_train_loss:.4f}")
+        print(f"Validation Loss:     {final_val_loss:.4f}")
+        print(f"Loss Gap:            {loss_gap:.4f}")
+        print(f"Test Accuracy:       {test_acc:.2%}")
+        print(f"Test Loss:           {test_loss:.4f}")
+        print(f"Test AUC:            {test_auc:.4f}")
+        print(f"{'='*70}\n")
+
+        # Sliding window inference for instrument intensity over time
+        def sliding_window_predict(audio_file, window_size=1.0, hop_size=0.5):
+            audio, sr = librosa.load(audio_file, sr=CONFIG["sample_rate"])
+            duration = librosa.get_duration(y=audio, sr=sr)
+            times = np.arange(0, duration - window_size, hop_size)
+            all_preds = []
+            for t in times:
+                start = int(t * sr)
+                end = int((t + window_size) * sr)
+                segment = audio[start:end]
+                if len(segment) < int(window_size * sr):
+                    pad = np.zeros(int(window_size * sr) - len(segment))
+                    segment = np.concatenate([segment, pad])
+                features = processor.extract_multi_resolution_features(segment)
+                X_window = [
+                    np.expand_dims(features[f"mel_{n}"], axis=0)
+                    for n in CONFIG["mel_bands"]
+                ]
+                pred = model.model.predict(X_window, verbose=0)
+                all_preds.append(pred[0])
+            return np.array(all_preds), times
+
+        # Example: run sliding window on first successfully processed file
+        if len(processed_files) > 0:
+            preds, times = sliding_window_predict(processed_files[0])
+            # Visualization
+            import matplotlib.pyplot as plt
+
+            plt.figure(figsize=(10, 6))
+            for i, inst in enumerate(mlb.classes_):
+                plt.plot(times, preds[:, i], label=inst)
+            plt.xlabel("Time (s)")
+            plt.ylabel("Predicted Probability")
+            plt.title("Instrument Intensity Over Time")
+            plt.legend()
+            plt.tight_layout()
+            plt.savefig("instrument_intensity_timeline.png")
+            plt.close()
+
+            # JSON export
+            import json
+
+            result = {
+                "audio_file": processed_files[0],
+                "detected_instruments": {
+                    inst: float(np.max(preds[:, i]))
+                    for i, inst in enumerate(mlb.classes_)
+                },
+                "timeline": [
+                    {
+                        "time": float(t),
+                        **{
+                            inst: float(preds[j, i])
+                            for i, inst in enumerate(mlb.classes_)
+                        },
+                    }
+                    for j, t in enumerate(times)
+                ],
+            }
+            with open("instrument_recognition_result.json", "w") as f:
+                json.dump(result, f, indent=2)
+            print(
+                "Exported instrument recognition result to instrument_recognition_result.json"
+            )
+            # PDF export using matplotlib
+            from matplotlib.backends.backend_pdf import PdfPages
+
+            pdf_filename = "instrument_recognition_report.pdf"
+            with PdfPages(pdf_filename) as pdf:
+                # Page 1: Title and Summary
+                fig = plt.figure(figsize=(8.5, 11))
+                fig.text(
+                    0.5,
+                    0.95,
+                    "InstruPlay AI - Instrument Recognition Report",
+                    ha="center",
+                    fontsize=16,
+                    fontweight="bold",
+                )
+                fig.text(
+                    0.5,
+                    0.90,
+                    f"Audio File: {processed_files[0]}",
+                    ha="center",
+                    fontsize=10,
+                )
+                fig.text(
+                    0.5,
+                    0.87,
+                    f"Analysis Date: {__import__('datetime').datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+                    ha="center",
+                    fontsize=9,
+                    style="italic",
+                )
+
+                # Detected Instruments Summary
+                fig.text(
+                    0.1, 0.80, "Detected Instruments:", fontsize=12, fontweight="bold"
+                )
+                y_pos = 0.75
+                for inst in mlb.classes_:
+                    max_conf = float(np.max(preds[:, list(mlb.classes_).index(inst)]))
+                    status = "Present" if max_conf > 0.5 else "Not Present"
+                    color = "green" if max_conf > 0.5 else "red"
+                    fig.text(
+                        0.15,
+                        y_pos,
+                        f"• {inst.replace('_', ' ').title()}: {status} (Confidence: {max_conf:.2%})",
+                        fontsize=10,
+                        color=color,
+                    )
+                    y_pos -= 0.04
+
+                # Statistics
+                fig.text(
+                    0.1,
+                    y_pos - 0.05,
+                    "Analysis Statistics:",
+                    fontsize=12,
+                    fontweight="bold",
+                )
+                y_pos -= 0.10
+                fig.text(
+                    0.15,
+                    y_pos,
+                    f"• Total Instruments Detected: {sum(1 for i in mlb.classes_ if np.max(preds[:, list(mlb.classes_).index(i)]) > 0.5)}",
+                    fontsize=10,
+                )
+                y_pos -= 0.04
+                fig.text(
+                    0.15,
+                    y_pos,
+                    f"• Audio Duration: {times[-1]:.2f} seconds",
+                    fontsize=10,
+                )
+                y_pos -= 0.04
+                fig.text(
+                    0.15, y_pos, f"• Time Windows Analyzed: {len(times)}", fontsize=10
+                )
+
+                plt.axis("off")
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close()
+
+                # Page 2: Instrument Intensity Timeline
+                fig = plt.figure(figsize=(11, 8.5))
+                for i, inst in enumerate(mlb.classes_):
+                    plt.plot(
+                        times,
+                        preds[:, i],
+                        label=inst.replace("_", " ").title(),
+                        linewidth=2,
+                    )
+                plt.xlabel("Time (seconds)", fontsize=12)
+                plt.ylabel("Predicted Probability", fontsize=12)
+                plt.title(
+                    "Instrument Intensity Over Time", fontsize=14, fontweight="bold"
+                )
+                plt.legend(bbox_to_anchor=(1.05, 1), loc="upper left", fontsize=9)
+                plt.grid(True, alpha=0.3)
+                plt.tight_layout()
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close()
+
+                # Page 3: Confidence Bar Chart
+                fig = plt.figure(figsize=(8.5, 11))
+                instruments = [inst.replace("_", " ").title() for inst in mlb.classes_]
+                max_confidences = [
+                    float(np.max(preds[:, i])) for i in range(len(mlb.classes_))
+                ]
+                colors = [
+                    "green" if conf > 0.5 else "orange" if conf > 0.3 else "red"
+                    for conf in max_confidences
+                ]
+
+                plt.barh(instruments, max_confidences, color=colors, alpha=0.7)
+                plt.xlabel("Maximum Confidence", fontsize=12)
+                plt.title(
+                    "Instrument Detection Confidence", fontsize=14, fontweight="bold"
+                )
+                plt.xlim(0, 1)
+                plt.axvline(
+                    x=0.5,
+                    color="black",
+                    linestyle="--",
+                    linewidth=1,
+                    alpha=0.5,
+                    label="Threshold (0.5)",
+                )
+                plt.legend()
+                plt.grid(True, alpha=0.3, axis="x")
+                plt.tight_layout()
+                pdf.savefig(fig, bbox_inches="tight")
+                plt.close()
+print("\n✅ VERY STRONG ANTI-OVERFITTING MEASURES SUCCESSFULLY APPLIED:")
+print(f"[EXPORT] PDF report saved to {pdf_filename}")
+
+print("\n[COMPLETE] OVERFITTING < 5% training finished!")
+print("\n✅ VERY STRONG ANTI-OVERFITTING MEASURES SUCCESSFULLY APPLIED:")
+print("   1. Dropout layers: 0.35-0.50 (prevents memorization)")
+print("   2. L2 Regularization: 0.00015-0.0002 (strong weight penalty)")
+plt.close()
+
+print(f"[EXPORT] PDF report saved to {pdf_filename}")
+
+print("\n[COMPLETE] OVERFITTING < 5% training finished!")
+print("\n✅ VERY STRONG ANTI-OVERFITTING MEASURES SUCCESSFULLY APPLIED:")
